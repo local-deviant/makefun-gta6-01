@@ -1,40 +1,38 @@
-// GOLDEN TIDE 3D — save / load (localStorage, one JSON key).
+// Save / load via localStorage. One slot, plain JSON, no network.
+const KEY = 'isla-fortuna-save-v1';
 
-const KEY = 'golden-tide-3d-save-v1';
-
-export function defaultSave() {
-  return {
-    cash: 250,
-    respect: 0,
-    missionsDone: [],
-    collectibles: [],
-    racesWon: 0,
-    faresDone: 0,
-    bestCar: null,
-    settings: { volume: 0.7, muted: false, shadows: true, sensitivity: 1 },
-    playMinutes: 0,
-  };
+export function saveGame(state) {
+  try {
+    const data = {
+      cash: state.cash,
+      respect: state.respect,
+      missionsDone: state.missionsDone,
+      racesWon: state.racesWon,
+      discs: state.discs,
+      faresDone: state.faresDone,
+      day: state.day,
+      hour: state.hour,
+      x: state.x,
+      z: state.z,
+      savedAt: new Date().toISOString(),
+    };
+    localStorage.setItem(KEY, JSON.stringify(data));
+    return true;
+  } catch (e) { return false; }
 }
 
-export function loadSave() {
+export function loadGame() {
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return defaultSave();
-    const s = JSON.parse(raw);
-    return { ...defaultSave(), ...s, settings: { ...defaultSave().settings, ...(s.settings || {}) } };
-  } catch (e) {
-    return defaultSave();
-  }
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) { return null; }
 }
 
-export function writeSave(save) {
-  try {
-    localStorage.setItem(KEY, JSON.stringify(save));
-  } catch (e) {
-    // storage full or unavailable: the game keeps running unsaved
-  }
+export function hasSave() {
+  try { return !!localStorage.getItem(KEY); } catch (e) { return false; }
 }
 
 export function clearSave() {
-  try { localStorage.removeItem(KEY); } catch (e) { /* ignore */ }
+  try { localStorage.removeItem(KEY); } catch (e) {}
 }

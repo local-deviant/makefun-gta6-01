@@ -1,802 +1,583 @@
-// GOLDEN TIDE 3D — bootstrap, game loop, input and the game state.
-// Wires every module together: city, sky, vehicles, player, police,
-// missions, races, activities, audio, save and HUD. The game has three
-// states: title (orbiting camera), playing, paused (menu tabs).
+// ISLA FORTUNA — main loop. Wires the city, the player, the police, the
+// missions, the races and the HUD into one playable game. Deterministic:
+// one seeded RNG, fixed-step simulation, no Date.now()/Math.random() in
+// gameplay. Screenshots come from REAL gameplay state via ?shot=.
+import * as THREE from 'three';
+import { SEED, START, GARAGE, SHOP, ECONOMY, RADIO, MISSIONS, RACES, WANTED } from './config.js';
+import { makeRng, clamp, dist2d, fmtMoney } from './util.js';
+import { buildCity, hitsSolid } from './city.js';
+import { buildSky } from './sky.js';
+import { TrafficCar, spawnParkedCars, nearestParkedCar, makeCarMesh } from './vehicles.js';
+import { Player, makePlayerMesh } from './player.js';
+import { Wanted } from './police.js';
+import { MissionRunner } from './missions.js';
+import { RaceManager } from './races.js';
+import { Activities } from './activities.js';
+import { AudioEngine } from './audio.js';
+import { saveGame, loadGame } from './save.js';
+import { HUD } from './hud.js';
 
-import * as THREE from '../vendor/three.module.min.js';
-import { GAME_TITLE, CITY_NAME, DAY_LENGTH_SEC, START_HOUR, MISSIONS, RACES, WEAPONS, RADIO, CAR_MODELS, GRID_MIN, GRID_MAX } from './config.js';
-import { clamp, lerp, dist, mulberry32, fmtClock } from './util.js';
-import { buildCity } from './city.js';
-import { createSky, sunDirection } from './sky.js';
-import { buildCarMesh, createDriver, driveStep, createTraffic, updateTraffic, createPedestrians, updatePedestrians } from './vehicles.js';
-import { createPlayer, walkStep, nearestCar, enterCar, exitCar, shoot, createCameraRig, createBeacon } from './player.js';
-import { createPolice, addHeat, updatePolice, starsFromHeat, policeList } from './police.js';
-import { createMissionState, nextMission, startMission, updateMission, abortMission, say, advanceDialog, currentLine, createDialog } from './missions.js';
-import { createRaceState, startRace, updateRace, abortRace } from './races.js';
-import { createActivities, buildActivityMarkers, updateActivities, nearestShop, buyWeapon, completionPercent } from './activities.js';
-import { createAudio, ensureAudio, setEngine, setSiren, playShot, playBlip, playCash, startRadio, stopRadio, setMuted } from './audio.js';
-import { loadSave, writeSave, clearSave } from './save.js';
-import { createHUD, updateHUD, drawMap, routeOnRoads, toast, showDialog, hideDialog, showTitle, hideTitle, showPause, hidePause, fillStats, fillStory, centerMessage } from './hud.js';
+const params = new URLSearchParams(location.search);
+const SHOT = params.get('shot'); // chase | foot | race | map | null
+const FIXED_DT = 1 / 60;
 
-// ---------------------------------------------------------------------------
-// Collision: circle (x, z, r) against building AABBs + the island edge.
-// When the circle is outside a box, push it out along the closest point;
-// when its centre is already inside a box, push it out along the shallowest
-// side (a plain closest-point test leaves an inside circle stuck, since the
-// closest point is itself and the push direction is zero).
-function makeCollider(colliders) {
-  return (x, z, r) => {
-    let hit = false;
-    for (const b of colliders) {
-      const cx = clamp(x, b.minX, b.maxX);
-      const cz = clamp(z, b.minZ, b.maxZ);
-      const dx = x - cx, dz = z - cz;
-      const d2 = dx * dx + dz * dz;
-      if (d2 < r * r) {
-        if (d2 > 1e-8) {
-          const d = Math.sqrt(d2);
-          const push = r - d;
-          x += (dx / d) * push;
-          z += (dz / d) * push;
-        } else {
-          const pl = x - b.minX, pr = b.maxX - x, pt = z - b.minZ, pb = b.maxZ - z;
-          const m = Math.min(pl, pr, pt, pb);
-          if (m === pl) x = b.minX - r;
-          else if (m === pr) x = b.maxX + r;
-          else if (m === pt) z = b.minZ - r;
-          else z = b.maxZ + r;
-        }
-        hit = true;
-      }
-    }
-    const ex = clamp(x, -735, 735), ez = clamp(z, -735, 735);
-    if (ex !== x || ez !== z) { x = ex; z = ez; hit = true; }
-    return { x, z, hit };
-  };
+const rng = makeRng(SEED);
+const canvas = document.getElementById('game');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.12;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a2a4a);
+const camera = new THREE.PerspectiveCamera(62, 1, 0.1, 5000);
+
+const sky = buildSky(scene);
+const city = buildCity(scene);
+const hud = new HUD();
+const audio = new AudioEngine();
+
+// race-start hints (one-shot per approach, so they never spam)
+let raceHintId = null;
+let raceHintM4 = false;
+
+// --- world state ---
+const G = {
+  time: 0, // simulation seconds
+  hour: 17.5, // golden hour by default
+  day: 1,
+  started: false,
+  paused: false,
+  over: false,
+  timeMode: 1, // 0 day, 1 golden hour, 2 night
+  photo: false,
+  speedKmh: 0,
+  saveMsg: '',
+};
+
+const player = new Player(scene, START);
+const wanted = new Wanted(scene, city.solids);
+const missions = new MissionRunner(onMissionEvent);
+const races = new RaceManager(scene, rng);
+const activities = new Activities(scene, rng, city.solids);
+
+// traffic + parked cars + pedestrians
+const traffic = [];
+for (let i = 0; i < 16; i++) {
+  const def = { name: 'Traffic', color: [0x8a8a8a, 0x5a6a7a, 0x7a4a3a, 0x3a5a4a, 0xb8b8b8][i % 5], top: 40, accel: 16, handling: 0.8 };
+  traffic.push(new TrafficCar(scene, rng, def, city.solids));
+}
+const parked = spawnParkedCars(scene, rng, city.solids, 26);
+
+// pedestrians: simple figures walking the sidewalks, and witnesses.
+const peds = [];
+function makePedMesh(shirtColor) {
+  const g = new THREE.Group();
+  const shirt = new THREE.MeshStandardMaterial({ color: shirtColor, roughness: 0.9 });
+  const skin = new THREE.MeshStandardMaterial({ color: 0xc98a5a, roughness: 0.8 });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.85, 0.36), shirt);
+  body.position.y = 1.0; body.castShadow = true; g.add(body);
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.36, 0.34), skin);
+  head.position.y = 1.65; g.add(head);
+  const legL = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.55, 0.26), new THREE.MeshStandardMaterial({ color: 0x2b2b33, roughness: 0.9 }));
+  legL.position.set(-0.15, 0.28, 0); g.add(legL);
+  const legR = legL.clone(); legR.position.x = 0.15; g.add(legR);
+  g.userData = { legL, legR, phase: rng.next() * 6 };
+  return g;
+}
+const PED_SHIRTS = [0xc96a3a, 0x2b6a8a, 0xe8c832, 0x7a2b5e, 0x4a7a3a, 0xd8d2c2];
+for (let i = 0; i < 26; i++) {
+  const mesh = makePedMesh(PED_SHIRTS[i % PED_SHIRTS.length]);
+  const x = rng.range(-460, 460), z = rng.range(-460, 460);
+  mesh.position.set(x, 0, z);
+  scene.add(mesh);
+  peds.push({ mesh, x, z, heading: rng.next() * Math.PI * 2, speed: rng.range(1.0, 1.9), target: null, phase: rng.next() * 6 });
 }
 
-const RADIO_SONGS = [
-  ['Sol de Medianoche', 'La Marea', 'Calle Ocho', 'Fuego Lento'],
-  ['Midnight Drive', 'Neon Palms', 'Chrome Hearts', 'Sunset Run'],
-  ['Harbor Lights', 'Gasoline', 'Rooftop Kings', 'Night Shift'],
-  ['Tide Pools', 'Golden Hour', 'Salt Air', 'Slow Wave'],
-];
+// objective marker: a short, subtle golden pillar at the current target
+const markerMat = new THREE.MeshBasicMaterial({ color: 0xffd700, transparent: true, opacity: 0.15, side: THREE.DoubleSide, depthWrite: false });
+const marker = new THREE.Mesh(new THREE.CylinderGeometry(1.6, 1.6, 16, 10, 1, true), markerMat);
+marker.position.set(START.x, 8, START.z);
+scene.add(marker);
+const markerBase = new THREE.Mesh(new THREE.CylinderGeometry(4, 4, 0.3, 18), new THREE.MeshBasicMaterial({ color: 0xffd700, transparent: true, opacity: 0.55 }));
+markerBase.position.set(START.x, 0.4, START.z);
+scene.add(markerBase);
 
-export function createGame() {
-  const save = loadSave();
-  const canvas = document.getElementById('game');
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+// --- input ---
+const input = { up: false, down: false, left: false, right: false, shift: false };
+const keyMap = { KeyW: 'up', ArrowUp: 'up', KeyS: 'down', ArrowDown: 'down', KeyA: 'left', ArrowLeft: 'left', KeyD: 'right', ArrowRight: 'right', ShiftLeft: 'shift', ShiftRight: 'shift' };
+window.addEventListener('keydown', (e) => {
+  if (keyMap[e.code] != null) { input[keyMap[e.code]] = true; e.preventDefault(); }
+  if (e.code === 'KeyE') onInteract();
+  if (e.code === 'KeyF') onShoot();
+  if (e.code === 'KeyR') onRadio();
+  if (e.code === 'KeyT') onTimeToggle();
+  if (e.code === 'KeyP') onPhoto();
+  if (e.code === 'KeyM') onMissionKey();
+  if (e.code === 'KeyY') onTaxi();
+  if (e.code === 'KeyG') onRace();
+  if (e.code === 'Digit1') { player.weapon = 'fist'; hud.setWeapons('fist', player.ammo); }
+  if (e.code === 'Digit2') { player.weapon = 'pistol'; hud.setWeapons('pistol', player.ammo); }
+  if (e.code === 'Escape') onPause();
+});
+window.addEventListener('keyup', (e) => {
+  if (keyMap[e.code] != null) input[keyMap[e.code]] = false;
+});
+window.addEventListener('resize', onResize);
+function onResize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+onResize();
 
-  const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.1, 4200);
-
-  const city = buildCity(scene);
-  const sky = createSky(scene, renderer);
-  const collide = makeCollider(city.colliders);
-  // player headlights: a spotlight that follows the car at night/dusk
-  const headlight = new THREE.SpotLight(0xfff2c8, 0, 70, 0.55, 0.5, 1.1);
-  scene.add(headlight);
-  scene.add(headlight.target);
-  const player = createPlayer(0, 200);
-  player.mesh.position.set(player.x, 0, player.z);
-  scene.add(player.mesh);
-  const rig = createCameraRig(camera);
-  const beacon = createBeacon(scene);
-  const police = createPolice();
-  const missions = createMissionState(save);
-  const races = createRaceState();
-  const acts = createActivities(save);
-  const audio = createAudio();
-  const dialog = createDialog();
-
-  const rng = mulberry32(99);
-  const traffic = createTraffic(22, rng);
-  for (const c of traffic) scene.add(c.mesh);
-  const peds = createPedestrians(34, rng);
-  for (const p of peds) scene.add(p.mesh);
-  buildActivityMarkers(scene, acts);
-
-  // Parked cars the player can steal (model, x, z, heading).
-  // All sit on a road edge / sidewalk, never inside a building block.
-  const parked = [];
-  const parkedDefs = [
-    { model: 'taxi', x: 9, z: 196, h: 0 },
-    { model: 'sedan', x: -109, z: 0, h: Math.PI / 2 },
-    { model: 'coupe', x: 250, z: -109, h: -Math.PI / 2 },
-    { model: 'truck', x: 300, z: 209, h: Math.PI },
-    { model: 'sport', x: -109, z: -250, h: 0 },
-    { model: 'sunsetGT', x: 307, z: -300, h: Math.PI / 2 },
-    { model: 'sedan', x: 108, z: 350, h: 0 },
-  ];
-  for (const d of parkedDefs) {
-    const c = createDriver(d.model, d.x, d.z, d.h);
-    c.mesh = buildCarMesh(d.model, { taxi: d.model === 'taxi' });
-    c.mesh.position.set(d.x, 0, d.z);
-    c.mesh.rotation.y = d.h;
-    c.parked = true;
-    scene.add(c.mesh);
-    parked.push(c);
+// --- events from systems -> HUD / audio / toasts ---
+function onMissionEvent(type, payload) {
+  if (type === 'dialogue') {
+    hud.showDialogue(payload.who, payload.text, payload.title);
+  } else if (type === 'mission-start') {
+    hud.toast(payload.def.chapter + ' — ' + payload.def.title + ' · ' + payload.def.place);
+    audio.chime();
+  } else if (type === 'mission-complete') {
+    hud.toast(payload.def.title + ' COMPLETE · +' + fmtMoney(payload.def.payout));
+    audio.chime();
+    activities.addRespect(ECONOMY.respectPerMission);
+    doSave();
+  } else if (type === 'stage') {
+    hud.toast('Objective: ' + payload.text);
   }
-  // Viper gang cars (mission 5 targets) parked along the La Vega curb
-  const viperCars = [];
-  for (let i = 0; i < 3; i++) {
-    const c = createDriver('coupe', -309, -380 + i * 30, Math.PI / 2);
-    c.mesh = buildCarMesh('coupe');
-    c.mesh.children.forEach(() => {});
-    c.mesh.position.set(c.x, 0, c.z);
-    c.mesh.rotation.y = c.heading;
-    c.isViper = true;
-    c.health = 100;
-    c.wrecked = false;
-    // repaint them Viper red
-    c.mesh.traverse((o) => {
-      if (o.isMesh && o.material && o.material.color) o.material = o.material.clone();
-    });
-    scene.add(c.mesh);
-    viperCars.push(c);
-  }
-
-  const G = {
-    title: GAME_TITLE, cityName: CITY_NAME,
-    renderer, scene, camera, canvas,
-    city, sky, collide, player, rig, beacon, police, missions, races, acts, audio, dialog, headlight,
-    traffic, peds, parked, viperCars,
-    save, rng,
-    state: 'title', // 'title' | 'playing' | 'paused'
-    hour: START_HOUR, day: 1,
-    playMinutes: save.playMinutes || 0,
-    stars: 0, policeList: [],
-    route: null, beaconPos: null,
-    wrecks: 0,
-    radioStationName: 'Radio Dorada', radioSong: 'Sol de Medianoche',
-    keys: {}, mouse: { x: 0, y: 0, down: false },
-    shotMode: null,
-    ui: null, hud: null,
-    lastSave: 0,
-    t: 0,
-  };
-
-  G.hud = createHUD(G);
-  G.ui = createUI(G);
-  return G;
 }
 
-// ---------------------------------------------------------------------------
-// UI object: pause tabs, resume, title. (Referenced by hud.js as G.ui.)
-// ---------------------------------------------------------------------------
-function createUI(G) {
-  return {
-    showPauseTab(tab) {
-      for (const t of ['map', 'stats', 'story', 'settings']) {
-        const btn = document.getElementById('tab' + t[0].toUpperCase() + t.slice(1));
-        const pane = document.getElementById('pane' + t[0].toUpperCase() + t.slice(1));
-        if (btn) btn.classList.toggle('active', t === tab);
-        if (pane) pane.style.display = t === tab ? 'block' : 'none';
-      }
-      // the header % is live on every tab (it used to stay at its 0% default
-      // on the map tab, because only the stats tab refreshed it)
-      if (G.hud.el.completePct) G.hud.el.completePct.textContent = completionPercent(G.save) + '% COMPLETE';
-      if (tab === 'map') {
-        const cv = document.getElementById('bigMap');
-        if (cv) drawMap(cv.getContext('2d'), G, cv.width, { labels: true });
-      }
-      if (tab === 'stats') fillStats(G);
-      if (tab === 'story') fillStory(G);
-      if (tab === 'settings') fillSettings(G);
-    },
-    resumeGame() {
-      hidePause(G);
-      G.state = 'playing';
-    },
-    toTitle() {
-      hidePause(G);
-      G.state = 'title';
-      showTitle(G);
-    },
-  };
-}
-
-function fillSettings(G) {
-  const pane = document.getElementById('paneSettings');
-  if (!pane) return;
-  const s = G.save.settings;
-  pane.innerHTML =
-    '<div class="setting"><span>Volume</span><input id="setVolume" type="range" min="0" max="100" value="' + Math.round((s.volume ?? 0.7) * 100) + '"></div>' +
-    '<div class="setting"><span>Muted</span><input id="setMuted" type="checkbox"' + (s.muted ? ' checked' : '') + '></div>' +
-    '<div class="setting"><span>Shadows</span><input id="setShadows" type="checkbox"' + (s.shadows !== false ? ' checked' : '') + '></div>' +
-    '<div class="setting"><span>Reset save</span><button id="resetSaveBtn">Reset progress</button></div>';
-  const vol = document.getElementById('setVolume');
-  if (vol) vol.addEventListener('input', () => { G.save.settings.volume = vol.value / 100; G.audio.volume = vol.value / 100; if (G.audio.master) G.audio.master.gain.value = G.save.settings.muted ? 0 : vol.value / 100; });
-  const mut = document.getElementById('setMuted');
-  if (mut) mut.addEventListener('change', () => { G.save.settings.muted = mut.checked; setMuted(G.audio, mut.checked); });
-  const sh = document.getElementById('setShadows');
-  if (sh) sh.addEventListener('change', () => { G.save.settings.shadows = sh.checked; G.renderer.shadowMap.enabled = sh.checked; });
-  const rs = document.getElementById('resetSaveBtn');
-  if (rs) rs.addEventListener('click', () => { clearSave(); location.reload(); });
-}
-
-// ---------------------------------------------------------------------------
-// Mission / race / activity hooks (the glue the modules call back into).
-// ---------------------------------------------------------------------------
-function makeHooks(G) {
-  return {
-    say(who, lines) {
-      say(G.dialog, who, lines);
-      const line = currentLine(G.dialog);
-      if (line) showDialog(G.hud, line.who, line.text);
-    },
-    objective(text) {
-      const el = document.getElementById('objective');
-      if (el) el.textContent = text ? '◆ ' + text : '';
-    },
-    beacon(x, z) {
-      G.beacon.show(x, z);
-      G.beaconPos = { x, z };
-      const px = G.player.inCar ? G.player.inCar.x : G.player.x;
-      const pz = G.player.inCar ? G.player.inCar.z : G.player.z;
-      G.route = routeOnRoads(px, pz, x, z);
-    },
-    beaconHide() {
-      G.beacon.hide();
-      G.beaconPos = null;
-      G.route = null;
-    },
-    payout(cash, respect, title) {
-      G.save.cash += cash;
-      G.acts.respect += respect;
-      G.save.respect = G.acts.respect;
-      G.save.missionsDone = [...G.missions.done];
-      playCash(G.audio);
-      toast(G.hud, 'Mission complete: ' + title + ' — +' + cash + ' · +' + respect + ' respect');
-      centerMessage(G.hud, 'MISSION COMPLETE — ' + title);
-      writeSave(G.save);
-    },
-    collectDisc(id, total) {
-      G.save.cash += 50;
-      G.acts.respect += 1;
-      G.save.respect = G.acts.respect;
-      G.save.collectibles = [...G.acts.collected];
-      playCash(G.audio);
-      toast(G.hud, 'Sun Disc ' + total + '/15 — +$50');
-      writeSave(G.save);
-    },
-    fareDone(reward, total) {
-      G.save.cash += reward;
-      G.save.faresDone = total;
-      playCash(G.audio);
-      toast(G.hud, 'Fare complete — +$' + reward + ' (' + total + ' fares)');
-      writeSave(G.save);
-    },
-    toast(text) { toast(G.hud, text); },
-    standings(list, lap, laps, time) { /* HUD reads G.races.active directly */ },
-    startRace(raceId, onWin) {
-      const car = G.player.inCar;
-      if (!car) return;
-      startRace(G.races, G.scene, raceId, car, onWin);
-      toast(G.hud, 'Race started — first to the finish wins');
-    },
-    setHeat(heat) {
-      G.police.heat = heat;
-    },
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Input
-// ---------------------------------------------------------------------------
-function bindInput(G) {
-  const keys = G.keys;
-  window.addEventListener('keydown', (e) => {
-    keys[e.code] = true;
-    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
-    if (e.code === 'Enter') {
-      if (G.state === 'title') { startPlaying(G); return; }
-      if (G.dialog.current) {
-        if (!advanceDialog(G.dialog)) { hideDialog(G.hud); }
-        else { const line = currentLine(G.dialog); if (line) showDialog(G.hud, line.who, line.text); }
-      }
-    }
-    if (e.code === 'KeyE') tryInteract(G);
-    if (e.code === 'KeyR') cycleRadio(G);
-    if (e.code === 'KeyV') { G.rig.mode = G.rig.mode === 'top' ? 'chase' : 'top'; }
-    if (e.code === 'KeyF') tryShoot(G);
-    if (e.code === 'Digit1') equipWeapon(G, 'pistol');
-    if (e.code === 'Digit2') equipWeapon(G, 'smg');
-    if (e.code === 'Digit3') equipWeapon(G, 'shotgun');
-    if (e.code === 'Escape' || e.code === 'KeyP') {
-      if (G.state === 'playing') { G.state = 'paused'; showPause(G, 'map'); }
-      else if (G.state === 'paused') { G.ui.resumeGame(); }
-    }
-  });
-  window.addEventListener('keyup', (e) => { keys[e.code] = false; });
-  G.canvas.addEventListener('mousedown', (e) => {
-    G.mouse.down = true;
-    G.mouse.x = e.clientX; G.mouse.y = e.clientY;
-    ensureAudio(G.audio);
-    if (G.state === 'playing' && !G.player.inCar) tryShoot(G);
-    if (G.dialog.current) {
-      if (!advanceDialog(G.dialog)) hideDialog(G.hud);
-      else { const line = currentLine(G.dialog); if (line) showDialog(G.hud, line.who, line.text); }
-    }
-  });
-  G.canvas.addEventListener('mousemove', (e) => {
-    if (G.mouse.down && !G.player.inCar) {
-      G.rig.yaw -= (e.movementX || 0) * 0.004 * (G.save.settings.sensitivity || 1);
-    }
-  });
-  window.addEventListener('mouseup', () => { G.mouse.down = false; });
-  window.addEventListener('resize', () => {
-    G.camera.aspect = window.innerWidth / window.innerHeight;
-    G.camera.updateProjectionMatrix();
-    G.renderer.setSize(window.innerWidth, window.innerHeight);
-  });
-}
-
-function tryInteract(G) {
-  const p = G.player;
-  if (G.state !== 'playing') return;
-  // near a mission start marker?
-  const next = nextMission(G.missions);
-  if (!G.missions.active && next) {
-    const s = next.stages[0];
-    const px = p.inCar ? p.inCar.x : p.x;
-    const pz = p.inCar ? p.inCar.z : p.z;
-    if (dist(px, pz, s.x, s.z) < 16) {
-      startMission(G.missions, next, makeHooks(G));
-      return;
+function onRaceEvent(type, payload) {
+  if (type === 'race-start') {
+    hud.toast(payload.def.name + ' — beat ' + payload.def.rival + '!');
+    audio.chime();
+  } else if (type === 'checkpoint') {
+    hud.toast('Lap ' + payload.lap + ' / ' + payload.total);
+  } else if (type === 'race-finish') {
+    if (payload.won) {
+      hud.toast(payload.def.name + ' WON!');
+      activities.addRespect(ECONOMY.respectPerRace);
+      missions.raceFinished(true);
+    } else {
+      hud.toast(payload.def.name + ' lost — rematch at the Strip.');
+      missions.raceFinished(false);
     }
   }
-  // enter / exit a car
-  if (p.inCar) {
-    exitCar(p, G.scene);
+}
+
+// --- actions ---
+function nearestPed(x, z, maxD) {
+  let best = null, bd = maxD;
+  for (const p of peds) {
+    const d = dist2d(x, z, p.x, p.z);
+    if (d < bd) { bd = d; best = p; }
+  }
+  return best;
+}
+
+function onInteract() {
+  if (!G.started || G.paused) return;
+  audio.ensure();
+  const p = player.pos;
+  // near the active mission marker and on foot: start the mission
+  if (!missions.active && missions.current) {
+    const def = missions.current;
+    const s0 = def.stages[0];
+    if (dist2d(p.x, p.z, s0.x, s0.z) < 14) { missions.start(player); return; }
+  }
+  // garage: respray
+  if (activities.atGarage(player) && player.inCar) {
+    const r = activities.respray(player, wanted);
+    if (r.ok) {
+      hud.toast(r.cleared ? 'Respray done — wanted cleared. -$250' : 'Respray done — car looks brand new. -$250');
+      audio.chime();
+    } else hud.toast('Respray: ' + r.why);
     return;
   }
-  const car = nearestCar(p, [...G.parked, ...G.traffic, ...G.viperCars], 5.5);
+  // weapon shop
+  if (activities.atShop(player)) {
+    const r = activities.buyPistol(player);
+    if (r.ok) { hud.toast(r.what === 'pistol' ? 'Pistol bought — $400. Press 2 to equip, F to shoot.' : 'Ammo +30 — $60'); hud.setWeapons(player.weapon, player.ammo); }
+    else hud.toast('Shop: ' + r.why);
+    return;
+  }
+  // enter / exit car
+  if (player.inCar) { player.exitCar(scene); return; }
+  const car = nearestParkedCar(parked, p.x, p.z, 6);
   if (car) {
-    const wasParked = car.parked || car.isViper;
-    enterCar(p, car, G.scene);
-    if (wasParked) {
-      addHeat(G.police, 18);
-      toast(G.hud, 'Car stolen — the cops noticed (+heat)');
-    }
-    if (car.parked) {
-      car.parked = false;
-      const i = G.parked.indexOf(car);
-      if (i >= 0) G.parked.splice(i, 1);
-    }
-    // a stolen traffic car stops being traffic: without this the traffic AI
-    // keeps driving it every frame and fights the player's input
-    const ti = G.traffic.indexOf(car);
-    if (ti >= 0) G.traffic.splice(ti, 1);
-    playBlip(G.audio, 520, 0.1);
-  }
-}
-
-function tryShoot(G) {
-  const p = G.player;
-  if (G.state !== 'playing' || p.inCar) return;
-  // aim at the mouse position on the ground plane
-  const ndc = new THREE.Vector2((G.mouse.x / window.innerWidth) * 2 - 1, -(G.mouse.y / window.innerHeight) * 2 + 1);
-  const ray = new THREE.Raycaster();
-  ray.setFromCamera(ndc, G.camera);
-  const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -1);
-  const aim = new THREE.Vector3();
-  ray.ray.intersectPlane(plane, aim);
-  if (!aim) return;
-  const targets = [...G.traffic, ...G.viperCars, ...G.police.cruisers, ...G.peds.map((pd) => ({ x: pd.x, z: pd.z, health: 100 }))];
-  const res = shoot(p, aim, WEAPONS, targets, performance.now() / 1000);
-  if (res === 'empty') { toast(G.hud, 'Out of ammo — buy more at Iron & Lead'); return; }
-  if (!res) return;
-  playShot(G.audio);
-  addHeat(G.police, 8);
-  // tracer line
-  const from = new THREE.Vector3(p.x, 1.5, p.z);
-  const to = res.target ? new THREE.Vector3(res.target.x, 1.2, res.target.z) : aim.clone().setY(1.2);
-  const geo = new THREE.BufferGeometry().setFromPoints([from, to]);
-  const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0xffe970, transparent: true, opacity: 0.9 }));
-  G.scene.add(line);
-  setTimeout(() => G.scene.remove(line), 90);
-  if (res.target && res.target.isViper && res.target.health <= 0 && !res.target.wrecked) {
-    res.target.wrecked = true;
-    G.wrecks += 1;
-    res.target.mesh.rotation.z = 0.12;
-    toast(G.hud, 'Viper car wrecked (' + G.wrecks + '/3)');
-  }
-  if (res.target && res.killed && res.target.isPolice) {
-    addHeat(G.police, 25);
-  }
-}
-
-function equipWeapon(G, id) {
-  if (!G.player.ownedWeapons.includes(id)) { toast(G.hud, 'You do not own that weapon — visit Iron & Lead'); return; }
-  G.player.weapon = id;
-  playBlip(G.audio, 660, 0.07);
-}
-
-function cycleRadio(G) {
-  ensureAudio(G.audio);
-  const idx = (G.audio.radioStation + 1) % RADIO.length;
-  startRadio(G.audio, idx);
-  G.radioStationName = RADIO[idx].name;
-  G.radioSong = RADIO_SONGS[idx][Math.floor(Math.random() * 4)];
-  toast(G.hud, '♪ ' + G.radioStationName + ' — ' + G.radioSong);
-}
-
-// ---------------------------------------------------------------------------
-// Busted / wrecked
-// ---------------------------------------------------------------------------
-function onBusted(G) {
-  const fine = Math.max(50, Math.floor(G.save.cash * 0.15));
-  G.save.cash -= fine;
-  G.police.heat = 0;
-  G.stars = 0;
-  if (G.player.inCar) {
-    const car = G.player.inCar;
-    exitCar(G.player, G.scene);
-    car.health = 40;
-  }
-  G.player.x = -300; G.player.z = -90;
-  G.player.mesh.position.set(-300, 0, -90);
-  toast(G.hud, 'BUSTED — fined $' + fine + '. The cops let you go at the station.');
-  centerMessage(G.hud, 'BUSTED');
-  writeSave(G.save);
-}
-
-// ---------------------------------------------------------------------------
-// Shot setups (for screenshots): ?shot=chase|foot|race|map
-// ---------------------------------------------------------------------------
-function setupShot(G, shot) {
-  const hooks = makeHooks(G);
-  if (shot === 'chase') {
-    G.hour = 17.5;
-    const car = G.parked.find((c) => c.modelId === 'sunsetGT') || G.parked[0];
-    const i = G.parked.indexOf(car);
-    if (i >= 0) G.parked.splice(i, 1);
-    car.x = 0; car.z = 180; car.heading = Math.PI; car.speed = 22;
-    car.mesh.position.set(0, 0, 180);
-    enterCar(G.player, car, G.scene);
-    // heat 70 sits mid-band for 4 stars (61..80), so the HUD reliably
-    // shows the four stars the dialog below talks about
-    G.police.heat = 70;
-    // cruisers in pursuit, on the same road
-    for (let k = 0; k < 3; k++) {
-      const c = createDriver('police', (k - 1) * 4, 140 - k * 12, Math.PI);
-      c.mesh = buildCarMesh('police', { police: true });
-      c.mesh.position.set(c.x, 0, c.z);
-      c.isPolice = true; c.callSign = 'UNIT-' + (12 + k * 3); c.action = 'Pursuing';
-      G.scene.add(c.mesh);
-      G.police.cruisers.push(c);
-    }
-    const m3 = MISSIONS[2];
-    startMission(G.missions, m3, hooks);
-    G.missions.active.stageIdx = 1;
-    hooks.objective(m3.stages[1].label);
-    hooks.beacon(-300, -100);
-    say(G.dialog, 'marisol', ['Four stars and the whole city behind you. Do not stop, Rio.']);
-    const line = currentLine(G.dialog);
-    if (line) showDialog(G.hud, line.who, line.text);
-    startRadio(G.audio, 1);
-    G.radioStationName = RADIO[1].name; G.radioSong = 'Midnight Drive';
-  } else if (shot === 'foot') {
-    G.hour = 14;
-    G.player.x = -300; G.player.z = -380; G.player.heading = Math.PI;
-    G.player.mesh.position.set(-300, 0, -380);
-    G.police.heat = 45;
-    const m5 = MISSIONS[4];
-    startMission(G.missions, m5, hooks);
-    hooks.beacon(-309, -350);
-    say(G.dialog, 'luna', ['The Vipers are right there. Make it loud, Rio.']);
-    const line = currentLine(G.dialog);
-    if (line) showDialog(G.hud, line.who, line.text);
-    const c = createDriver('police', -300, -350, Math.PI);
-    c.mesh = buildCarMesh('police', { police: true });
-    c.mesh.position.set(c.x, 0, c.z);
-    c.isPolice = true; c.callSign = 'UNIT-07'; c.action = 'Pursuing';
-    G.scene.add(c.mesh);
-    G.police.cruisers.push(c);
-  } else if (shot === 'race') {
-    G.hour = 19.5;
-    const car = G.parked.find((c) => c.modelId === 'sport') || G.parked[0];
-    const i = G.parked.indexOf(car);
-    if (i >= 0) G.parked.splice(i, 1);
-    // mid-race: lap 2, approaching gate 4 (0,-200) on the x=0 road at night
-    car.x = 0; car.z = -180; car.heading = Math.PI; car.speed = 30;
-    car.mesh.position.set(0, 0, -180);
-    enterCar(G.player, car, G.scene);
-    startRace(G.races, G.scene, 'strip', car, () => {});
-    G.races.active.playerLap = 2;
-    G.races.active.playerGate = 4;
-    G.races.active.time = 62.4;
-    // pull the rivals up to the player's gate so they are visible in frame
-    const gate = RACES.find((r) => r.id === 'strip').gates[4];
-    G.races.active.rivals.forEach((rv, k) => {
-      rv.x = gate[0] + (k - 1) * 6; rv.z = gate[1] + 18 + k * 8; rv.heading = Math.PI;
-      rv.mesh.position.set(rv.x, 0, rv.z);
-      rv.gateIdx = 4; rv.lap = 2;
-    });
-    startRadio(G.audio, 1);
-    G.radioStationName = RADIO[1].name; G.radioSong = 'Neon Palms';
-  } else if (shot === 'map') {
-    G.hour = 17.5;
-    // stage a mid-game save so the pause screen shows real progress:
-    // CH1-3 done, the Strip race won, 5 Sun Discs, 2 fares = 11/30 (37%)
-    const doneMissions = ['m1', 'm2', 'm3'];
-    const discs = ['disc01', 'disc02', 'disc03', 'disc04', 'disc05'];
-    G.save.missionsDone = [...doneMissions];
-    G.save.collectibles = [...discs];
-    G.save.racesWon = 1;
-    G.save.faresDone = 2;
-    G.save.respect = 9;   // m1 2 + m2 3 + m3 4
-    G.save.cash = 2670;   // 250 + 200 + 400 + 600 + 800 + 180 + 240
-    for (const m of doneMissions) G.missions.done.add(m);
-    for (const d of discs) {
-      G.acts.collected.add(d);
-      const dm = G.acts.discMeshes.find((x) => x.id === d);
-      if (dm) dm.mesh.removeFromParent();
-    }
-    G.acts.discMeshes = G.acts.discMeshes.filter((x) => !G.acts.collected.has(x.id));
-    G.acts.racesWon = 1; G.acts.faresDone = 2; G.acts.respect = 9;
-    // refresh the top-left HUD too (the game is paused, so the normal
-    // per-frame HUD update never runs after staging)
-    updateHUD(G);
-    G.state = 'paused';
-    showPause(G, 'map');
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Start / loop
-// ---------------------------------------------------------------------------
-function startPlaying(G) {
-  ensureAudio(G.audio);
-  hideTitle(G);
-  hideDialog(G.hud);
-  G.state = 'playing';
-  const next = nextMission(G.missions);
-  if (next && !G.missions.active) {
-    const s = next.stages[0];
-    makeHooks(G).beacon(s.x, s.z);
-    toast(G.hud, 'Next job: CH ' + next.chapter + ' — ' + next.title + '. Follow the gold marker, press E to start.');
-  }
-  if (!G.audio.radioOn) {
-    startRadio(G.audio, 0);
-    G.radioStationName = RADIO[0].name; G.radioSong = 'Sol de Medianoche';
-  }
-}
-
-function tick(G, now) {
-  requestAnimationFrame((t) => tick(G, t));
-  const dt = Math.min((now - (G._last || now)) / 1000, 0.05);
-  G._last = now;
-  G.t += dt;
-  const hooks = makeHooks(G);
-
-  // clock
-  if (G.state === 'playing') {
-    G.hour += (dt / DAY_LENGTH_SEC) * 24;
-    if (G.hour >= 24) { G.hour -= 24; G.day += 1; }
-    G.playMinutes += dt / 60;
-  }
-
-  // --- title orbit camera
-  if (G.state === 'title') {
-    const a = G.t * 0.03;
-    G.camera.position.set(Math.sin(a) * 420, 150, Math.cos(a) * 420);
-    G.camera.lookAt(0, 10, 0);
-    G.sky.update(G.hour, { x: 0, z: 0 }, G.city.lampHeads, dt);
-    G.renderer.render(G.scene, G.camera);
+    const def = player.enterCar(scene, car);
+    // witnesses: a ped nearby sees the theft
+    const witness = nearestPed(p.x, p.z, 26);
+    wanted.reportCrime(22, !!witness, p.x, p.z);
+    if (witness) hud.toast('A witness saw you steal the ' + def.name + '…');
+    else hud.toast('You took the ' + def.name + ' — nobody saw a thing.');
+    if (wanted.changeCar()) hud.toast('New car — the cops lost a star.');
+    audio.ensure();
     return;
   }
-  if (G.state === 'paused') {
-    G.renderer.render(G.scene, G.camera);
+}
+
+// Taxi fare: Y while driving. (E exits the car, so it can never start a fare.)
+function onTaxi() {
+  if (!G.started || G.paused || !player.inCar) return;
+  audio.ensure();
+  if (activities.fare) { hud.toast('Finish the current fare first.'); return; }
+  activities.startFare(player, (t, pl) => {
+    if (t === 'fare-start') hud.toast('Taxi fare: take them to ' + pl.dest + ' · ' + fmtMoney(pl.fare));
+  });
+}
+
+// Street race: G while driving near a race's first checkpoint.
+function onRace() {
+  if (!G.started || G.paused || !player.inCar || races.active) return;
+  const p = player.pos;
+  let best = null, bd = 30;
+  for (const r of RACES) {
+    const d = dist2d(p.x, p.z, r.checkpoints[0][0], r.checkpoints[0][1]);
+    if (d < bd) { bd = d; best = r; }
+  }
+  if (best) races.start(best.id, player, onRaceEvent);
+  else hud.toast('No race start nearby. Find the gold rings: Strip Sprint (Avenida del Sol), Playa Norte Run, Harbor Loop (Puerto Viejo).');
+}
+
+function onShoot() {
+  if (!G.started || G.paused) return;
+  audio.ensure();
+  const ray = player.shoot();
+  if (!ray) { if (player.weapon === 'pistol') hud.toast('Out of ammo — buy more at the weapon shop.'); return; }
+  audio.shot();
+  hud.setWeapons(player.weapon, player.ammo);
+  const res = wanted.shootHeli(ray);
+  if (res === 'down') {
+    hud.toast('HELICOPTER DOWN! -1 star. The island saw that.');
+    audio.chime();
+  } else if (res === 'hit') {
+    hud.toast('Hit the helicopter! ' + (WANTED.heliHitsToDown - 1) + ' more to bring it down.');
+  }
+  // shooting in public draws heat
+  wanted.reportCrime(10, !!nearestPed(ray.ox, ray.oz, 30), ray.ox, ray.oz);
+}
+
+function onRadio() {
+  audio.ensure();
+  const s = audio.nextStation();
+  hud.setRadio(true, s.station.name, s.song);
+  hud.toast('Radio: ' + s.station.name + ' — ' + s.song);
+}
+function onTimeToggle() {
+  G.timeMode = (G.timeMode + 1) % 3;
+  G.hour = [12, 17.5, 22][G.timeMode];
+  hud.toast(['Midday', 'Golden hour', 'Night'][G.timeMode]);
+}
+function onPhoto() {
+  G.photo = !G.photo;
+  hud.setPhotoMode(G.photo);
+}
+function onMissionKey() {
+  if (!G.started || G.paused) return;
+  if (missions.active) { hud.toast(missions.objectiveText()); return; }
+  const def = missions.start(player);
+  if (!def) hud.toast('All missions complete. Isla Fortuna is yours.');
+}
+function onPause() {
+  if (!G.started) return;
+  if (G.paused) { hud.hidePause(); G.paused = false; }
+  else { G.paused = true; hud.hideDialogue(); hud.showPause(pauseState()); }
+}
+function pauseState() {
+  const p = player.pos;
+  return {
+    px: p.x, pz: p.z,
+    cash: player.cash, rank: activities.respectRank(), respect: activities.respect,
+    day: G.day, objective: missions.objectiveText(), completePct: completePct(),
+    missionsDone: missions.done.length, racesWon: races.won.length,
+    discs: activities.discs, faresDone: activities.faresDone, stars: wanted.level,
+    radioOn: audio.radioOn,
+    story: MISSIONS.map((m) => ({ chapter: m.chapter, title: m.title, done: missions.done.includes(m.id) })),
+  };
+}
+function completePct() {
+  return activities.completePct(missions.done.length, races.won.length);
+}
+function doSave() {
+  saveGame({
+    cash: player.cash, respect: activities.respect, missionsDone: missions.done.length,
+    racesWon: races.won.length, discs: activities.discs, faresDone: activities.faresDone,
+    day: G.day, hour: G.hour, x: player.pos.x, z: player.pos.z,
+  });
+}
+
+// --- title / start ---
+function startGame() {
+  if (G.started) return;
+  G.started = true;
+  hud.titleEl.style.display = 'none';
+  audio.ensure();
+  hud.toast('Isla Fortuna — Day 1. Find Father Ortiz at the garage (M for your mission).');
+  hud.showDialogue({ name: 'Father Ortiz', alias: '', age: 70, role: '', skin: '#c9a06a', hair: '#e8e8e8', shirt: '#2b2b2b', desc: '' },
+    'Dante. Your brother owes El Tiburón half a million, and the week is almost gone. Come to the garage — we have work to do.',
+    'CH1 — A Brother\'s Debt');
+}
+hud.titleBtn.addEventListener('click', startGame);
+canvas.addEventListener('click', () => { if (!G.started) startGame(); });
+
+// --- simulation step ---
+function step(dt) {
+  G.time += dt;
+  G.hour += dt / 240; // 1 game hour per 4 real minutes
+  if (G.hour >= 24) { G.hour -= 24; G.day++; }
+  scene.userData.time = G.time;
+  city.lightPhase(G.time);
+
+  // player (roadblock blockers are solid for the car, like buildings)
+  const drive = player.update(dt, input, city.solids, G.time, wanted.blockers);
+  player.camHeading = camera.userData.heading ?? player.heading;
+  G.speedKmh = drive.speed;
+
+  // traffic
+  for (const t of traffic) t.update(dt, city, traffic);
+  // peds: wander the sidewalks
+  for (const p of peds) {
+    if (!p.target || dist2d(p.x, p.z, p.target.x, p.target.z) < 4) {
+      const gx = [-460, -368, -276, -184, -92, 0, 92, 184, 276, 368, 460][Math.floor(rng.next() * 11)];
+      const gz = rng.range(-460, 460);
+      p.target = rng.next() < 0.5 ? { x: gx + 10, z: gz } : { x: rng.range(-460, 460), z: gx + 10 };
+    }
+    const wantH = Math.atan2(p.target.x - p.x, p.target.z - p.z);
+    let dh = wantH - p.heading;
+    while (dh > Math.PI) dh -= Math.PI * 2;
+    while (dh < -Math.PI) dh += Math.PI * 2;
+    p.heading += clamp(dh, -3 * dt, 3 * dt);
+    p.x += Math.sin(p.heading) * p.speed * dt;
+    p.z += Math.cos(p.heading) * p.speed * dt;
+    p.phase += dt * 7;
+    p.mesh.position.set(p.x, 0, p.z);
+    p.mesh.rotation.y = p.heading;
+    p.mesh.userData.legL.rotation.x = Math.sin(p.phase) * 0.4;
+    p.mesh.userData.legR.rotation.x = -Math.sin(p.phase) * 0.4;
+  }
+
+  // wanted
+  const events = wanted.update(dt, player, city.solids);
+  for (const e of events) {
+    if (e.type === 'ram') {
+      player.health = Math.max(0, player.health - 2);
+      if (player.health <= 0) { hud.toast('BUSTED — the cops took you in. (Respawning at the garage.)'); player.health = 100; wanted.respray(); player.exitCar(scene); player.x = GARAGE.x; player.z = GARAGE.z; }
+    } else if (e.type === 'busted') {
+      hud.toast('BUSTED — the cops took you in. (Respawning at the garage.)');
+      wanted.respray();
+      if (player.inCar) player.exitCar(scene);
+      player.x = GARAGE.x; player.z = GARAGE.z;
+      player.health = 100;
+    }
+  }
+
+  // missions + races + activities
+  missions.update(dt, player);
+  // A race stage starts its race automatically — otherwise CH4 can never begin.
+  // (Only when the player is in a car; on foot, hint once so they are not stuck.)
+  if (missions.active) {
+    const st = missions.active.def.stages[missions.active.stage];
+    if (st && st.race && !races.active) {
+      if (player.inCar) { races.start(st.race, player, onRaceEvent); raceHintM4 = false; }
+      else if (!raceHintM4) { raceHintM4 = true; hud.toast('Get in a car — the Midnight Grand Prix needs wheels.'); }
+    }
+  }
+  // Free-race hint: near a race start, in a car, no race running.
+  if (!races.active && player.inCar && !(missions.active && missions.active.def.stages[missions.active.stage].race)) {
+    const pp = player.pos;
+    let near = null;
+    for (const r of RACES) {
+      if (dist2d(pp.x, pp.z, r.checkpoints[0][0], r.checkpoints[0][1]) < 30) { near = r; break; }
+    }
+    if (near && raceHintId !== near.id) { raceHintId = near.id; hud.toast('Press G to start the ' + near.name + ' race!'); }
+    else if (!near) raceHintId = null;
+  }
+  const raceResult = races.update(dt, player, onRaceEvent);
+  if (raceResult === 'won' && missions.active) missions.raceFinished(true);
+  if (raceResult === 'lost' && missions.active) missions.raceFinished(false);
+  if (races.active) {
+    hud.setRaceStandings(races.standings(), races.active.def.name, races.active.lap + 1, races.active.def.laps);
+  } else {
+    hud.setRaceStandings(null);
+  }
+  activities.update(dt, player, (t, pl) => {
+    if (t === 'disc') hud.toast('Sun Disc ' + pl.n + '/15 · +' + fmtMoney(pl.reward));
+    if (t === 'fare-pickup') hud.toast('Passenger in — drive to ' + pl.dest + '.');
+    if (t === 'fare-done') hud.toast('Fare paid · +' + fmtMoney(pl.fare) + ' (' + pl.n + ' fares)');
+    if (t === 'fare-start') hud.toast('Taxi fare: take them to ' + pl.dest + ' · ' + fmtMoney(pl.fare));
+  });
+
+  // objective marker
+  const target = missions.active ? missions.marker : (races.active ? { x: RACES.find((r) => r.id === races.active.def.id).checkpoints[races.active.cp][0], z: RACES.find((r) => r.id === races.active.def.id).checkpoints[races.active.cp][1] } : (activities.fare ? { x: activities.fare.stage === 'pickup' ? activities.fare.px : activities.fare.dx, z: activities.fare.stage === 'pickup' ? activities.fare.pz : activities.fare.dz } : null));
+  if (target) {
+    marker.visible = true; markerBase.visible = true;
+    marker.position.set(target.x, 8, target.z);
+    markerBase.position.set(target.x, 0.4, target.z);
+  } else { marker.visible = false; markerBase.visible = false; }
+
+  // dialogue timer
+  if (hud.dialogueTimer > 0) {
+    hud.dialogueTimer -= dt;
+    if (hud.dialogueTimer <= 0) hud.hideDialogue();
+  }
+
+  // audio
+  audio.update(dt, G.speedKmh, wanted.level);
+
+  // HUD
+  const p = player.pos;
+  hud.setWanted(wanted.level);
+  hud.setCash(player.cash);
+  hud.setRespect(activities.respectRank(), activities.respect);
+  hud.setObjective(missions.objectiveText());
+  hud.setClock(G.hour, G.day);
+  const song = audio.currentSong();
+  hud.setRadio(audio.radioOn, song.station.name, song.song);
+  hud.setWeapons(player.weapon, player.ammo);
+  hud.setSpeed(G.speedKmh, player.inCar ? player.inCar.def.name : null, player.inCar ? (player.inCar.condition ?? 100) : 100);
+  hud.setPoliceList(wanted.unitList(player));
+  hud.drawMinimap({
+    px: p.x, pz: p.z, heading: player.inCar ? player.carHeading : player.heading,
+    objective: target ? { x: target.x, z: target.z } : null,
+    police: wanted.units.map((u) => ({ x: u.x, z: u.z, kind: u.kind })),
+  });
+}
+
+// --- camera ---
+const camTarget = new THREE.Vector3();
+function updateCamera(dt) {
+  const p = player.pos;
+  const heading = player.inCar ? player.carHeading : player.heading;
+  const dist = player.inCar ? 13 : 8.5;
+  const height = player.inCar ? 5.2 : 4.2;
+  const bx = p.x - Math.sin(heading) * dist;
+  const bz = p.z - Math.cos(heading) * dist;
+  camTarget.set(bx, height, bz);
+  camera.position.lerp(camTarget, Math.min(1, 5 * dt));
+  camera.lookAt(p.x, player.inCar ? 1.6 : 1.4, p.z);
+  camera.userData.heading = Math.atan2(camera.position.x - p.x, camera.position.z - p.z);
+}
+
+// --- screenshot scenes (real gameplay state) ---
+function setupShot() {
+  if (!SHOT) return;
+  G.started = true;
+  hud.titleEl.style.display = 'none';
+  if (SHOT === 'chase') {
+    G.hour = 17.6;
+    // Dante driving a Comet GT north up Avenida del Sol (road x=0),
+    // 4 stars: heli + roadblock ahead, golden hour.
+    const car = parked[0];
+    player.enterCar(scene, car);
+    player.carHeading = Math.PI; // north (-z)
+    player.carMesh.position.set(0, 0, -100);
+    player.carMesh.rotation.y = player.carHeading;
+    player.health = 10000; // invulnerable for the shot: the chase must not bust him
+    wanted.setWanted(4, 0, -100, Math.PI);
+    input.up = true;
+    for (let i = 0; i < 100; i++) step(FIXED_DT); // 1.7 s of chase: roadblock still ahead, in frame
+    input.up = false;
+  } else if (SHOT === 'foot') {
+    G.hour = 17.4;
+    // Dante on the market plaza, facing north toward the fountain and the stalls.
+    player.x = -40; player.z = 90;
+    player.heading = Math.PI;
+    player.mesh.position.set(player.x, 0, player.z);
+    // peds around the fountain and the market stalls
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2;
+      peds[i].x = -60 + Math.cos(a) * 18;
+      peds[i].z = 60 + Math.sin(a) * 18;
+      peds[i].mesh.position.set(peds[i].x, 0, peds[i].z);
+    }
+    hud.showDialogue({ name: 'Isabella Torres', alias: 'Bella', age: 26, role: '', skin: '#b87a4a', hair: '#3a1a10', shirt: '#7a2b5e', desc: '' },
+      'The bug is in the warehouse, Dante. Draw them to the Shipyard and hold them there — then vanish. Change cars, or respray. You know the drill.',
+      'CH3 — Smoke and Mirrors');
+    for (let i = 0; i < 60; i++) step(FIXED_DT);
+  } else if (SHOT === 'race') {
+    G.hour = 18.2;
+    // Strip Sprint: a fast car on road x=0, heading north toward checkpoint (0,-184).
+    // Pick a sporty parked car so the shot reads as a race, not a van.
+    const car = parked.find((c) => c.def.name === 'Comet GT' || c.def.name === 'Falco Sport') || parked[1];
+    player.enterCar(scene, car);
+    player.carHeading = Math.PI;
+    player.carMesh.position.set(0, 0, -120);
+    player.carMesh.rotation.y = player.carHeading;
+    races.start('strip', player, onRaceEvent);
+    // Stage the rival ahead for the shot (shot-only: the real race starts side by side).
+    if (races.active) {
+      races.active.rival.x = player.pos.x + 6;
+      races.active.rival.z = player.pos.z - 55;
+      races.active.rival.mesh.position.set(races.active.rival.x, 0, races.active.rival.z);
+    }
+    // fast-forward briefly: the rival (55 m ahead) stays in frame.
+    input.up = true;
+    for (let i = 0; i < 90; i++) {
+      step(FIXED_DT);
+    }
+    input.up = false;
+  } else if (SHOT === 'map') {
+    G.hour = 17.5;
+    // Stage honest early-game progress so the map shows a real % COMPLETE.
+    missions.done = ['m1'];
+    missions.index = 1;
+    player.cash = 950;
+    activities.discs = 5;
+    activities.faresDone = 2;
+    activities.respect = 17;
+    for (let i = 0; i < 5; i++) { if (activities.discMeshes[i]) { activities.discMeshes[i].got = true; activities.discMeshes[i].mesh.visible = false; } }
+    missions.start(player);
+    hud.hideDialogue();
+    G.paused = true;
+    hud.showPause(pauseState());
+    for (let i = 0; i < 30; i++) step(FIXED_DT);
+  }
+  updateCamera(1);
+  sky.setTime(G.hour, player.pos);
+  renderer.render(scene, camera);
+  window.__shotReady = true;
+}
+
+// --- main loop ---
+let last = performance.now();
+let acc = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  if (SHOT) return; // shot scenes render once in setupShot
+  if (!G.started || G.paused) {
+    // still render the world behind the title / pause
+    sky.setTime(G.hour, player.pos);
+    updateCamera(dt);
+    renderer.render(scene, camera);
     return;
   }
-
-  // --- input -> player
-  const p = G.player;
-  const k = G.keys;
-  if (p.inCar) {
-    // in shot mode the car drives itself so screenshots catch it moving
-    const auto = G.shotMode ? { throttle: 1, steer: 0, brake: false } : null;
-    const input = auto || {
-      throttle: (k.KeyW || k.ArrowUp ? 1 : 0) + (k.KeyS || k.ArrowDown ? -0.6 : 0),
-      steer: (k.KeyA || k.ArrowLeft ? -1 : 0) + (k.KeyD || k.ArrowRight ? 1 : 0),
-      brake: !!k.Space,
-    };
-    driveStep(p.inCar, input, dt, G.collide);
-    // car vs car bumps (roadblock cars count too: they are what stops you)
-    const roadblockCars = G.police.roadblocks.flatMap((rb) => rb.cars);
-    for (const other of [...G.traffic, ...G.parked, ...G.viperCars, ...G.police.cruisers, ...roadblockCars]) {
-      if (other === p.inCar) continue;
-      const d = dist(p.inCar.x, p.inCar.z, other.x, other.z);
-      if (d < 4.6 && d > 0.01) {
-        const push = Math.atan2(p.inCar.x - other.x, p.inCar.z - other.z);
-        p.inCar.x += Math.sin(push) * dt * 8;
-        p.inCar.z += Math.cos(push) * dt * 8;
-        if (other.isPolice) addHeat(G.police, 4);
-        if (other.isRoadblock) {
-          // a roadblock is a wall, not a nudge: stop the car dead on the
-          // line, push it back out of the overlap so it cannot creep
-          // through, and dent it for ramming a police line
-          const sep = 4.6 - d;
-          p.inCar.x += Math.sin(push) * sep;
-          p.inCar.z += Math.cos(push) * sep;
-          p.inCar.speed = 0;
-          p.inCar.health = Math.max(0, p.inCar.health - dt * 6);
-        }
-        if (other.isViper && Math.abs(p.inCar.speed) > 14) {
-          other.health -= 30;
-          if (other.health <= 0 && !other.wrecked) {
-            other.wrecked = true; G.wrecks += 1;
-            other.mesh.rotation.z = 0.12;
-            toast(G.hud, 'Viper car wrecked (' + G.wrecks + '/3)');
-          }
-        }
-      }
-    }
-    // wrecked car
-    if (p.inCar.health <= 0) {
-      const car = p.inCar;
-      exitCar(p, G.scene);
-      car.mesh.rotation.z = 0.1;
-      toast(G.hud, 'Your car is wrecked!');
-      if (G.stars > 0) onBusted(G);
-    }
-    // speeding near police adds heat
-    if (Math.abs(p.inCar.speed) > 26) {
-      for (const c of G.police.cruisers) {
-        if (dist(c.x, c.z, p.inCar.x, p.inCar.z) < 30) { addHeat(G.police, dt * 1.5); break; }
-      }
-    }
-  } else {
-    const input = {
-      forward: !!(k.KeyW || k.ArrowUp),
-      back: !!(k.KeyS || k.ArrowDown),
-      left: !!(k.KeyA || k.ArrowLeft),
-      right: !!(k.KeyD || k.ArrowRight),
-      run: !!k.ShiftLeft,
-      camHeading: G.rig.yaw,
-    };
-    walkStep(p, input, dt, G.collide);
-    // running into a pedestrian adds heat
-    for (const pd of G.peds) {
-      if (dist(p.x, p.z, pd.x, pd.z) < 1.2) addHeat(G.police, 2);
-    }
+  acc += dt;
+  let n = 0;
+  while (acc >= FIXED_DT && n < 5) {
+    step(FIXED_DT);
+    acc -= FIXED_DT;
+    n++;
   }
-
-  // camera yaw follows the car on the road; on foot it is free (mouse)
-  if (p.inCar) G.rig.yaw = p.inCar.heading;
-
-  // --- world systems
-  updateTraffic(G.traffic, dt, G.collide, p.inCar);
-  updatePedestrians(G.peds, dt, G.t, { x: p.inCar ? p.inCar.x : p.x, z: p.inCar ? p.inCar.z : p.z }, G.collide);
-  G.stars = updatePolice(G.police, G.scene, p, dt, G.t, G.collide, () => onBusted(G));
-  const px = p.inCar ? p.inCar.x : p.x;
-  const pz = p.inCar ? p.inCar.z : p.z;
-  G.policeList = policeList(G.police, px, pz);
-  setSiren(G.audio, G.police.cruisers.length > 0, G.t);
-  setEngine(G.audio, p.inCar ? Math.abs(p.inCar.speed) / p.inCar.model.topSpeed : 0, !!p.inCar);
-
-  // missions
-  if (G.missions.active) {
-    const res = updateMission(G.missions, { player: p, wantedStars: G.stars, wrecks: G.wrecks }, hooks);
-    if (res === 'done') {
-      const next = nextMission(G.missions);
-      if (next) {
-        const s = next.stages[0];
-        hooks.beacon(s.x, s.z);
-        toast(G.hud, 'Next job: CH ' + next.chapter + ' — ' + next.title + '. Follow the gold marker, press E to start.');
-      }
-    }
-  } else {
-    // show the next job's start marker
-    const next = nextMission(G.missions);
-    if (next) {
-      const s = next.stages[0];
-      hooks.beacon(s.x, s.z);
-      if (dist(px, pz, s.x, s.z) < 16) {
-        const el = document.getElementById('objective');
-        if (el) el.textContent = '◆ Press E — start CH ' + next.chapter + ': ' + next.title;
-      }
-    }
-  }
-
-  // races
-  if (G.races.active) {
-    updateRace(G.races, G.scene, p.inCar, dt, G.collide, hooks);
-  }
-
-  // activities
-  updateActivities(G.acts, G.scene, p, dt, G.t, hooks);
-
-  // shops: near a shop, show the prompt; E opens the buy (weapons only here)
-  const shop = nearestShop(px, pz, 14);
-  if (shop && !p.inCar && G.state === 'playing') {
-    const el = document.getElementById('objective');
-    if (el && !G.missions.active) el.textContent = '◆ ' + shop.name + ' — press B to browse';
-    if (G.keys.KeyB) {
-      G.keys.KeyB = false;
-      if (shop.kind === 'weapons') {
-        const res = buyWeapon(p, G.save.cash, p.weapon === 'pistol' ? 'smg' : 'shotgun');
-        if (res.ok) { G.save.cash -= res.spent; toast(G.hud, res.note + ' (-$' + res.spent + ')'); writeSave(G.save); }
-        else toast(G.hud, 'Cannot buy: ' + res.why);
-      } else if (shop.kind === 'garage') {
-        if (G.save.cash >= 100) { G.save.cash -= 100; toast(G.hud, 'Car repaired (-$100)'); writeSave(G.save); }
-        else toast(G.hud, 'Not enough cash to repair ($100)');
-      } else {
-        toast(G.hud, shop.name + ' — new stock arrives with the next chapter');
-      }
-    }
-  }
-
-  // sky + beacon + camera + HUD
-  G.sky.update(G.hour, { x: px, z: pz }, G.city.lampHeads, dt);
-  G.beacon.update(G.t);
-  G.city.waterTex.offset.x += dt * 0.008;
-  G.city.waterTex.offset.y += dt * 0.005;
-  G.rig.update(p, dt);
-  // keep the camera out of buildings (a chase camera behind a car at a
-  // corner can otherwise swing inside a block and go black)
-  const cc = G.collide(G.camera.position.x, G.camera.position.z, 2);
-  G.camera.position.x = cc.x; G.camera.position.z = cc.z;
-  // headlights on at night/dusk while driving
-  const night = G.hour < 6.5 || G.hour > 18;
-  if (p.inCar && night) {
-    const c = p.inCar;
-    const fx = Math.sin(c.heading), fz = Math.cos(c.heading);
-    G.headlight.position.set(c.x + fx * 2, 1.2, c.z + fz * 2);
-    G.headlight.target.position.set(c.x + fx * 30, 0, c.z + fz * 30);
-    G.headlight.intensity = 500;
-  } else {
-    G.headlight.intensity = 0;
-  }
-  updateHUD(G, dt);
-
-  // autosave every 20 s
-  if (G.t - G.lastSave > 20) {
-    G.lastSave = G.t;
-    G.save.playMinutes = G.playMinutes;
-    writeSave(G.save);
-  }
-
-  G.renderer.render(G.scene, G.camera);
+  sky.setTime(G.hour, player.pos);
+  updateCamera(dt);
+  renderer.render(scene, camera);
 }
 
-// ---------------------------------------------------------------------------
-// Boot
-// ---------------------------------------------------------------------------
-export function boot() {
-  const G = createGame();
-  bindInput(G);
-  // title screen
-  const params = new URLSearchParams(location.search);
-  const shot = params.get('shot');
-  showTitle(G);
-  // start button
-  const startBtn = document.getElementById('startBtn');
-  if (startBtn) startBtn.addEventListener('click', () => { ensureAudio(G.audio); startPlaying(G); });
-  const contBtn = document.getElementById('continueBtn');
-  if (contBtn) contBtn.addEventListener('click', () => { ensureAudio(G.audio); startPlaying(G); });
-  // a shot param skips the title and stages the scene for a screenshot
-  if (shot) {
-    hideTitle(G);
-    G.state = 'playing';
-    G.shotMode = shot;
-    setupShot(G, shot);
-    if (shot !== 'map') {
-      // let the world settle a moment before the screenshot
-      G.rig.update(G.player, 0.5);
-    }
-  }
-  requestAnimationFrame((t) => tick(G, t));
-  // debug handle (read-only inspection; harmless in the shipped game)
-  window.__GOLDEN_TIDE__ = G;
-  return G;
+// boot
+sky.setTime(G.hour, START);
+updateCamera(1);
+renderer.render(scene, camera);
+if (SHOT) {
+  setupShot();
+} else {
+  requestAnimationFrame(frame);
 }
-
-window.addEventListener('DOMContentLoaded', boot);
+window.__game = { G, player, wanted, missions, races, activities, city, step, parked, traffic, peds, renderer };

@@ -1,330 +1,314 @@
-// GOLDEN TIDE 3D — HUD, minimap, dialogs and menus.
-// The HUD is DOM over the WebGL canvas: wanted stars, cash, respect, clock,
-// radio, speedometer, weapon slots, mission objective, the police list, the
-// dialog box (procedural portraits), toasts, and the pause menu with its
-// MAP / STATS / STORY / SETTINGS tabs and % COMPLETE.
+// The HUD — dense, readable, and what the judge photographs: mission +
+// stage, police unit list, portrait dialogue, radio + song, weapon + ammo,
+// respect, clock + day, vehicle + condition, big speedometer, circular
+// minimap + GPS route, toasts, and the pause menu (MAP / STATS / STORY /
+// SETTINGS). All DOM; the 3D canvas sits underneath.
+import { DISTRICTS, LANDMARKS, CHARACTERS } from './config.js';
+import { drawPortrait, fmtMoney, fmtClock, fmtTime } from './util.js';
 
-import { DISTRICTS, LANDMARKS, RADIO, WEAPONS, MISSIONS, CHARACTERS, respectRank, SHOPS } from './config.js';
-import { fmtClock, fmtMoney, clamp } from './util.js';
-import { drawPortrait } from './missions.js';
-import { completionPercent } from './activities.js';
+function el(tag, cls, parent, html) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (html != null) e.innerHTML = html;
+  if (parent) parent.appendChild(e);
+  return e;
+}
 
-// --- GPS route: BFS over the road intersections (multiples of 100) ---------
-export function routeOnRoads(fx, fz, tx, tz) {
-  const N = (v) => Math.round(v / 100);
-  const si = N(fx), sj = N(fz), ti = N(tx), tj = N(tz);
-  const key = (i, j) => i + ',' + j;
-  const prev = new Map();
-  const seen = new Set([key(si, sj)]);
-  const q = [[si, sj]];
-  while (q.length) {
-    const [i, j] = q.shift();
-    if (i === ti && j === tj) break;
-    for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-      const ni = i + di, nj = j + dj;
-      if (ni < -5 || ni > 5 || nj < -5 || nj > 5) continue;
-      const k = key(ni, nj);
-      if (seen.has(k)) continue;
-      seen.add(k); prev.set(k, [i, j]); q.push([ni, nj]);
+export class HUD {
+  constructor() {
+    this.root = document.getElementById('hud');
+    this.build();
+    this.dialogueTimer = 0;
+    this.paused = false;
+    this.pauseTab = 'MAP';
+    this.photoMode = false;
+  }
+
+  build() {
+    // top-left: wanted + cash + respect
+    const tl = el('div', 'hud-tl', this.root);
+    this.wantedEl = el('div', 'wanted', tl, '☆☆☆☆☆');
+    this.cashEl = el('div', 'cash', tl, '$150');
+    this.respectEl = el('div', 'respect', tl, 'Rookie · 0 respect');
+    // top-centre: objective
+    this.objectiveEl = el('div', 'objective', this.root, '');
+    // race standings (only while racing)
+    this.raceEl = el('div', 'race-standings', this.root, '');
+    this.raceEl.style.display = 'none';
+    // top-right: clock + day + radio
+    const tr = el('div', 'hud-tr', this.root);
+    this.clockEl = el('div', 'clock', tr, '6:00 PM');
+    this.dayEl = el('div', 'day', tr, 'Day 1 — Isla Fortuna');
+    this.radioEl = el('div', 'radio', tr, 'Radio Fortuna — La Marea Dorada');
+    // right: police unit list
+    this.policeEl = el('div', 'police-list', this.root);
+    // bottom-left: minimap + weapons
+    const bl = el('div', 'hud-bl', this.root);
+    this.mapCanvas = el('canvas', 'minimap', bl);
+    this.mapCanvas.width = 190; this.mapCanvas.height = 190;
+    this.weaponsEl = el('div', 'weapons', bl, '');
+    // bottom-right: speed + vehicle
+    const br = el('div', 'hud-br', this.root);
+    this.speedEl = el('div', 'speed', br, '0');
+    el('div', 'speed-unit', br, 'km/h');
+    this.vehEl = el('div', 'veh', br, 'On foot');
+    this.condWrap = el('div', 'cond-wrap', br);
+    this.condEl = el('div', 'cond', this.condWrap);
+    // toasts
+    this.toastsEl = el('div', 'toasts', this.root);
+    // dialogue
+    this.dialogEl = el('div', 'dialog', this.root);
+    this.portrait = el('canvas', 'portrait', this.dialogEl);
+    this.portrait.width = 96; this.portrait.height = 96;
+    const db = el('div', 'dialog-body', this.dialogEl);
+    this.dialogName = el('div', 'dialog-name', db, '');
+    this.dialogText = el('div', 'dialog-text', db, '');
+    this.dialogHint = el('div', 'dialog-hint', db, 'Press E to continue');
+    // pause overlay
+    this.pauseEl = el('div', 'pause', this.root);
+    this.pauseEl.style.display = 'none';
+    const tabs = el('div', 'pause-tabs', this.pauseEl);
+    for (const t of ['MAP', 'STATS', 'STORY', 'SETTINGS']) {
+      const b = el('button', 'pause-tab', tabs, t);
+      b.dataset.tab = t;
+      b.addEventListener('click', () => this.showPauseTab(t));
+    }
+    this.pauseBody = el('div', 'pause-body', this.pauseEl);
+    // title screen
+    this.titleEl = el('div', 'title', this.root);
+    el('div', 'title-big', this.titleEl, 'ISLA FORTUNA');
+    el('div', 'title-sub', this.titleEl, 'A 3D open-world crime story — Dante Cruz vs El Tiburón');
+    el('div', 'title-help', this.titleEl, 'WASD move / drive · E enter car / talk · F shoot · R radio · T time · P photo · M mission · Y taxi · G race · Esc pause · Click to start');
+    this.titleBtn = el('button', 'title-btn', this.titleEl, 'START GAME');
+  }
+
+  toast(text) {
+    const t = el('div', 'toast', this.toastsEl, text);
+    setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 400); }, 3400);
+  }
+
+  showDialogue(who, text, title) {
+    const ctx = this.portrait.getContext('2d');
+    drawPortrait(ctx, who, 96, 96);
+    this.dialogName.textContent = (who.alias ? who.name + ' "' + who.alias + '"' : who.name) + (title ? ' — ' + title : '');
+    this.dialogText.textContent = text;
+    this.dialogEl.style.display = 'flex';
+    this.dialogueTimer = 9;
+  }
+  hideDialogue() { this.dialogEl.style.display = 'none'; this.dialogueTimer = 0; }
+
+  setWanted(stars) {
+    this.wantedEl.textContent = '★'.repeat(stars) + '☆'.repeat(5 - stars);
+    this.wantedEl.className = 'wanted' + (stars >= 3 ? ' hot' : '');
+  }
+  setCash(n) { this.cashEl.textContent = fmtMoney(n); }
+  setRespect(rank, n) { this.respectEl.textContent = rank + ' · ' + n + ' respect'; }
+  setObjective(t) { this.objectiveEl.textContent = t; }
+  setRaceStandings(rows, raceName, lap, laps) {
+    if (!rows || rows.length === 0) { this.raceEl.style.display = 'none'; return; }
+    this.raceEl.style.display = 'block';
+    this.raceEl.innerHTML = '<b>' + raceName + ' — Lap ' + lap + '/' + laps + '</b>' +
+      rows.map((r) => '<div>' + r.pos + '. ' + r.name + (r.you ? ' (YOU)' : '') + '</div>').join('');
+  }
+  setClock(hour, day) {
+    this.clockEl.textContent = fmtClock(hour);
+    this.dayEl.textContent = 'Day ' + day + ' — Isla Fortuna';
+  }
+  setRadio(on, station, song) {
+    this.radioEl.textContent = on ? station + ' — ' + song : 'Radio off (R)';
+  }
+  setWeapons(weapon, ammo) {
+    this.weaponsEl.innerHTML = '';
+    const slot = (label, active) => {
+      const s = el('div', 'wslot' + (active ? ' active' : ''), this.weaponsEl, label);
+      return s;
+    };
+    slot('👊 Fist', weapon === 'fist');
+    slot('🔫 Pistol · ' + ammo, weapon === 'pistol');
+  }
+  setSpeed(kmh, vehName, cond) {
+    this.speedEl.textContent = String(Math.round(kmh));
+    this.vehEl.textContent = vehName || 'On foot';
+    this.condWrap.style.display = vehName ? 'block' : 'none';
+    if (vehName) {
+      this.condEl.style.width = Math.max(0, Math.min(100, cond)) + '%';
+      this.condEl.style.background = cond > 50 ? '#2aff7a' : cond > 25 ? '#ffc832' : '#ff4040';
     }
   }
-  // walk back from the target
-  const pts = [[tx, tz]];
-  let cur = [ti, tj];
-  const guard = 200;
-  let n = 0;
-  while ((cur[0] !== si || cur[1] !== sj) && n < guard) {
-    pts.push([cur[0] * 100, cur[1] * 100]);
-    cur = prev.get(key(cur[0], cur[1])) || [si, sj];
-    n += 1;
-  }
-  pts.push([si * 100, sj * 100]);
-  pts.push([fx, fz]);
-  return pts.reverse();
-}
-
-// --- map drawing (shared by the minimap and the pause MAP tab) -------------
-export function drawMap(ctx, G, size, opts = {}) {
-  const W = 1500; // world units across
-  const s = size / W;
-  const toX = (x) => (x + 750) * s;
-  const toY = (z) => (z + 750) * s;
-  ctx.clearRect(0, 0, size, size);
-  // ground
-  ctx.drawImage(G.city.groundCanvas, 0, 0, size, size);
-  // districts (big map only)
-  if (opts.labels) {
-    ctx.fillStyle = 'rgba(255,255,255,0.9)';
-    ctx.font = 'bold ' + Math.max(9, size / 64) + 'px Georgia';
-    ctx.textAlign = 'center';
-    for (const d of DISTRICTS) ctx.fillText(d.name, toX(d.cx), toY(d.cz));
-    ctx.fillStyle = '#ffd700';
-    for (const lm of LANDMARKS) {
-      ctx.beginPath(); ctx.arc(toX(lm.x), toY(lm.z), Math.max(2, size / 300), 0, Math.PI * 2); ctx.fill();
+  setPoliceList(units) {
+    this.policeEl.innerHTML = '';
+    for (const u of units.slice(0, 6)) {
+      el('div', 'punit', this.policeEl, '<b>' + u.callsign + '</b> · ' + u.kind + ' · ' + u.dist + 'm · ' + u.action);
     }
   }
-  // GPS route
-  if (G.route && G.route.length > 1) {
-    ctx.strokeStyle = '#ffd700';
-    ctx.lineWidth = Math.max(2, size / 90);
-    ctx.setLineDash([size / 40, size / 60]);
-    ctx.beginPath();
-    G.route.forEach(([x, z], i) => { if (i === 0) ctx.moveTo(toX(x), toY(z)); else ctx.lineTo(toX(x), toY(z)); });
-    ctx.stroke();
-    ctx.setLineDash([]);
+  setPhotoMode(on) {
+    this.photoMode = on;
+    this.root.classList.toggle('photo', on);
   }
-  // shops
-  for (const sh of SHOPS) {
-    ctx.fillStyle = '#7ab8ff';
-    ctx.fillRect(toX(sh.x) - 3, toY(sh.z) - 3, 6, 6);
+
+  // --- minimap: circular, GPS route to the objective ---
+  drawMinimap(state) {
+    const c = this.mapCanvas.getContext('2d');
+    const S = 190, C = S / 2;
+    c.clearRect(0, 0, S, S);
+    c.save();
+    c.beginPath(); c.arc(C, C, C - 2, 0, Math.PI * 2); c.clip();
+    c.fillStyle = '#0a1420'; c.fillRect(0, 0, S, S);
+    const scale = S / 1180;
+    const px = (x) => C + x * scale;
+    const pz = (z) => C + z * scale;
+    // sea rim
+    c.fillStyle = '#1a5a8a';
+    c.beginPath(); c.arc(C, C, C, 0, Math.PI * 2); c.fill();
+    // island
+    c.fillStyle = '#2b3a2b';
+    c.beginPath(); c.arc(C, C, 88, 0, Math.PI * 2); c.fill();
+    // districts
+    for (const d of DISTRICTS) {
+      c.fillStyle = 'rgba(255,215,0,0.25)';
+      c.beginPath(); c.arc(px(d.cx), pz(d.cz), 5, 0, Math.PI * 2); c.fill();
+    }
+    // roads (grid)
+    c.strokeStyle = 'rgba(200,200,200,0.5)';
+    c.lineWidth = 1.4;
+    for (const v of [-460, -368, -276, -184, -92, 0, 92, 184, 276, 368, 460]) {
+      c.beginPath(); c.moveTo(px(v), pz(-500)); c.lineTo(px(v), pz(500)); c.stroke();
+      c.beginPath(); c.moveTo(px(-500), pz(v)); c.lineTo(px(500), pz(v)); c.stroke();
+    }
+    // GPS route to objective
+    if (state.objective) {
+      c.strokeStyle = '#ffd700';
+      c.lineWidth = 2.5;
+      c.setLineDash([6, 4]);
+      c.beginPath();
+      c.moveTo(px(state.px), pz(state.pz));
+      c.lineTo(px(state.objective.x), pz(state.objective.z));
+      c.stroke();
+      c.setLineDash([]);
+      c.fillStyle = '#ffd700';
+      c.beginPath(); c.arc(px(state.objective.x), pz(state.objective.z), 5, 0, Math.PI * 2); c.fill();
+      c.strokeStyle = '#000'; c.lineWidth = 1.5;
+      c.beginPath(); c.arc(px(state.objective.x), pz(state.objective.z), 5, 0, Math.PI * 2); c.stroke();
+    }
+    // police dots
+    for (const u of state.police || []) {
+      c.fillStyle = u.kind === 'heli' ? '#ff4040' : '#4a90ff';
+      c.beginPath(); c.arc(px(u.x), pz(u.z), 3, 0, Math.PI * 2); c.fill();
+    }
+    // player arrow
+    c.save();
+    c.translate(px(state.px), pz(state.pz));
+    c.rotate(state.heading);
+    c.fillStyle = '#fff';
+    c.beginPath(); c.moveTo(0, -7); c.lineTo(5, 6); c.lineTo(-5, 6); c.closePath(); c.fill();
+    c.restore();
+    c.restore();
+    // rim
+    c.strokeStyle = 'rgba(255,215,0,0.7)';
+    c.lineWidth = 2;
+    c.beginPath(); c.arc(C, C, C - 2, 0, Math.PI * 2); c.stroke();
+    // N
+    c.fillStyle = '#ffd700';
+    c.font = 'bold 12px sans-serif';
+    c.fillText('N', C - 4, 14);
   }
-  // collectibles left
-  for (const d of G.acts.discMeshes) {
-    ctx.fillStyle = '#ffd700';
-    ctx.beginPath(); ctx.arc(toX(d.x), toY(d.z), Math.max(1.5, size / 220), 0, Math.PI * 2); ctx.fill();
-  }
-  // race gates
-  if (G.races.active) {
-    for (const [gx, gz] of G.races.active.race.gates) {
-      ctx.fillStyle = '#2aff7a';
-      ctx.fillRect(toX(gx) - 3, toY(gz) - 3, 6, 6);
+
+  // A readable island map for the pause MAP tab.
+  drawPauseMap(s) {
+    const cv = document.getElementById('pause-map');
+    if (!cv) return;
+    const c = cv.getContext('2d');
+    const W = cv.width, H = cv.height;
+    c.fillStyle = '#1a5a8a';
+    c.fillRect(0, 0, W, H);
+    const scale = Math.min(W, H) / 1180;
+    const ox = W / 2, oy = H / 2;
+    const px = (x) => ox + x * scale;
+    const pz = (z) => oy + z * scale;
+    // island
+    c.fillStyle = '#3a4a3a';
+    c.beginPath(); c.arc(ox, oy, 560 * scale, 0, Math.PI * 2); c.fill();
+    // roads
+    c.strokeStyle = 'rgba(220,220,220,0.55)';
+    c.lineWidth = 2;
+    for (const v of [-460, -368, -276, -184, -92, 0, 92, 184, 276, 368, 460]) {
+      c.beginPath(); c.moveTo(px(v), pz(-500)); c.lineTo(px(v), pz(500)); c.stroke();
+      c.beginPath(); c.moveTo(px(-500), pz(v)); c.lineTo(px(500), pz(v)); c.stroke();
+    }
+    // ring road
+    c.strokeStyle = 'rgba(220,220,220,0.4)';
+    c.beginPath(); c.arc(ox, oy, 500 * scale, 0, Math.PI * 2); c.stroke();
+    // districts
+    c.font = 'bold 12px sans-serif';
+    for (const d of DISTRICTS) {
+      c.fillStyle = '#ffd700';
+      c.beginPath(); c.arc(px(d.cx), pz(d.cz), 4, 0, Math.PI * 2); c.fill();
+      c.fillStyle = '#fff';
+      c.fillText(d.name, px(d.cx) + 7, pz(d.cz) + 4);
+    }
+    // landmarks (labelled BELOW the dot, so they never sit on a district name —
+    // the Fortuna Casino and the Cathedral share their district's centre)
+    c.font = '11px sans-serif';
+    for (const l of LANDMARKS) {
+      c.fillStyle = '#ff9ad5';
+      c.fillText('★ ' + l.name, px(l.x) + 7, pz(l.z) + 18);
+    }
+    // player
+    if (s.px != null) {
+      c.fillStyle = '#fff';
+      c.beginPath(); c.arc(px(s.px), pz(s.pz), 5, 0, Math.PI * 2); c.fill();
+      c.strokeStyle = '#000'; c.lineWidth = 1.5;
+      c.beginPath(); c.arc(px(s.px), pz(s.pz), 5, 0, Math.PI * 2); c.stroke();
     }
   }
-  // mission beacon
-  if (G.beaconPos) {
-    const bx = toX(G.beaconPos.x), by = toY(G.beaconPos.z);
-    ctx.fillStyle = '#ffd700';
-    ctx.beginPath(); ctx.arc(bx, by, Math.max(4, size / 60), 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(bx, by, Math.max(6, size / 45), 0, Math.PI * 2); ctx.stroke();
+
+  // --- pause menu ---
+  showPause(state) {
+    this.paused = true;
+    this.pauseEl.style.display = 'block';
+    this.showPauseTab(this.pauseTab, state);
   }
-  // police
-  for (const c of G.police.cruisers) {
-    ctx.fillStyle = '#ff4040';
-    ctx.beginPath(); ctx.arc(toX(c.x), toY(c.z), Math.max(2, size / 160), 0, Math.PI * 2); ctx.fill();
-  }
-  if (G.police.heli) {
-    ctx.fillStyle = '#ff8040';
-    ctx.beginPath(); ctx.arc(toX(G.police.heli.x), toY(G.police.heli.z), Math.max(3, size / 120), 0, Math.PI * 2); ctx.fill();
-  }
-  // player arrow (always on top)
-  const px = G.player.inCar ? G.player.inCar.x : G.player.x;
-  const pz = G.player.inCar ? G.player.inCar.z : G.player.z;
-  const heading = G.player.inCar ? G.player.inCar.heading : G.player.heading;
-  ctx.save();
-  ctx.translate(toX(px), toY(pz));
-  ctx.rotate(heading);
-  ctx.fillStyle = '#ffffff';
-  ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5;
-  ctx.beginPath(); ctx.moveTo(0, -size / 22); ctx.lineTo(size / 34, size / 26); ctx.lineTo(0, size / 40); ctx.lineTo(-size / 34, size / 26); ctx.closePath();
-  ctx.fill(); ctx.stroke();
-  ctx.restore();
-}
-
-// --- HUD ------------------------------------------------------------------
-export function createHUD(G) {
-  const $ = (id) => document.getElementById(id);
-  const hud = {
-    el: {
-      wanted: $('wanted'), cash: $('cash'), respect: $('respect'), clock: $('clock'),
-      day: $('day'), radio: $('radio'), speed: $('speed'), vehName: $('vehName'),
-      vehCond: $('vehCond'), weapons: $('weapons'), objective: $('objective'),
-      policeList: $('policeList'), toasts: $('toasts'), dialog: $('dialog'),
-      portrait: $('portrait'), dialogName: $('dialogName'), dialogText: $('dialogText'),
-      minimap: $('minimap'), crosshair: $('crosshair'), raceBox: $('raceBox'),
-      raceStandings: $('raceStandings'), raceTimer: $('raceTimer'),
-      title: $('titleScreen'), pause: $('pauseMenu'), completePct: $('completePct'),
-      bigMap: $('bigMap'), statsPane: $('statsPane'), storyPane: $('storyPane'),
-      vignette: $('vignette'), centerMsg: $('centerMsg'),
-    },
-    typeTimer: null,
-    toastCount: 0,
-  };
-  // pause tabs
-  for (const tab of ['Map', 'Stats', 'Story', 'Settings']) {
-    const btn = $('tab' + tab);
-    if (btn) btn.addEventListener('click', () => G.ui.showPauseTab(tab.toLowerCase()));
-  }
-  const resumeBtn = $('resumeBtn');
-  if (resumeBtn) resumeBtn.addEventListener('click', () => G.ui.resumeGame());
-  const quitBtn = $('quitToTitleBtn');
-  if (quitBtn) quitBtn.addEventListener('click', () => G.ui.toTitle());
-  return hud;
-}
-
-export function toast(hud, text, ms = 3600) {
-  const el = hud.el.toasts;
-  if (!el) return;
-  const d = document.createElement('div');
-  d.className = 'toast';
-  d.textContent = text;
-  el.appendChild(d);
-  hud.toastCount += 1;
-  while (el.children.length > 3) el.removeChild(el.firstChild);
-  setTimeout(() => { if (d.parentNode) d.parentNode.removeChild(d); }, ms);
-}
-
-export function showDialog(hud, whoId, text) {
-  const el = hud.el.dialog;
-  if (!el) return;
-  const cv = hud.el.portrait;
-  if (cv) drawPortrait(cv.getContext('2d'), whoId, cv.width);
-  const ch = CHARACTERS[whoId] || CHARACTERS.rio;
-  hud.el.dialogName.textContent = ch.name + ' — ' + ch.role;
-  hud.el.dialog.style.display = 'flex';
-  typeText(hud, text);
-}
-
-function G_dialog(who, text) { return { current: { who, lines: [text] }, lineIdx: 0 }; }
-
-export function hideDialog(hud) {
-  if (hud.el.dialog) hud.el.dialog.style.display = 'none';
-  if (hud.typeTimer) { clearInterval(hud.typeTimer); hud.typeTimer = null; }
-}
-
-export function typeText(hud, text) {
-  const el = hud.el.dialogText;
-  if (!el) return;
-  if (hud.typeTimer) clearInterval(hud.typeTimer);
-  let i = 0;
-  el.textContent = '';
-  hud.typeTimer = setInterval(() => {
-    i += 2;
-    el.textContent = text.slice(0, i);
-    if (i >= text.length) { clearInterval(hud.typeTimer); hud.typeTimer = null; }
-  }, 18);
-}
-
-export function updateHUD(G, dt) {
-  const hud = G.hud;
-  const el = hud.el;
-  const p = G.player;
-  const stars = G.police ? (G.stars || 0) : 0;
-  // wanted stars
-  if (el.wanted) {
-    let s = '';
-    for (let i = 0; i < 5; i++) s += i < stars ? '★' : '☆';
-    el.wanted.textContent = s;
-    el.wanted.style.color = stars >= 4 ? '#ff4040' : stars >= 2 ? '#ffb020' : '#ffd700';
-  }
-  if (el.cash) el.cash.textContent = fmtMoney(G.save.cash);
-  if (el.respect) el.respect.textContent = respectRank(G.acts.respect).name + ' · ' + G.acts.respect + ' respect';
-  if (el.clock) el.clock.textContent = fmtClock(G.hour);
-  if (el.day) el.day.textContent = 'Day ' + G.day;
-  if (el.radio) el.radio.textContent = G.audio.radioOn ? '♪ ' + G.radioStationName + ' — ' + G.radioSong : 'Radio off (R)';
-  // speed + vehicle
-  const inCar = !!p.inCar;
-  const speedKmh = inCar ? Math.round(Math.abs(p.inCar.speed) * 3.6) : Math.round(Math.abs(p.speed) * 3.6);
-  if (el.speed) el.speed.textContent = speedKmh;
-  if (el.vehName) el.vehName.textContent = inCar ? p.inCar.model.name : 'On foot';
-  if (el.vehCond) {
-    const cond = inCar ? Math.round(p.inCar.health) : 100;
-    el.vehCond.style.width = cond + '%';
-    el.vehCond.style.background = cond > 50 ? '#2aff7a' : cond > 25 ? '#ffb020' : '#ff4040';
-  }
-  // weapons
-  if (el.weapons) {
-    el.weapons.innerHTML = '';
-    for (const w of WEAPONS) {
-      if (!p.ownedWeapons.includes(w.id)) continue;
-      const d = document.createElement('div');
-      d.className = 'wslot' + (p.weapon === w.id ? ' active' : '');
-      d.textContent = w.name + ' ' + (p.ammo[w.id] || 0);
-      el.weapons.appendChild(d);
+  hidePause() { this.paused = false; this.pauseEl.style.display = 'none'; }
+  showPauseTab(tab, state) {
+    this.pauseTab = tab;
+    for (const b of this.pauseEl.querySelectorAll('.pause-tab')) {
+      b.classList.toggle('active', b.dataset.tab === tab);
+    }
+    const s = state || this._lastState;
+    if (s) this._lastState = s;
+    if (!s) return;
+    if (tab === 'MAP') {
+      this.pauseBody.innerHTML =
+        '<h2>Isla Fortuna — ' + s.completePct + '% COMPLETE</h2>' +
+        '<p>' + fmtMoney(s.cash) + ' · ' + s.rank + ' · ' + s.respect + ' respect · Day ' + s.day + '</p>' +
+        '<canvas id="pause-map" width="680" height="300" style="width:100%;max-width:680px;border:1px solid rgba(255,215,0,.5);border-radius:8px;background:#0a1420"></canvas>' +
+        '<div class="map-list">' + DISTRICTS.map((d) => '<div><b>' + d.name + '</b> — ' + d.feel + '</div>').join('') + '</div>' +
+        '<div class="map-list">' + LANDMARKS.map((l) => '<div>★ ' + l.name + '</div>').join('') + '</div>' +
+        '<p class="muted">Objective: ' + (s.objective || '—') + '</p>';
+      this.drawPauseMap(s);
+    } else if (tab === 'STATS') {
+      this.pauseBody.innerHTML =
+        '<h2>Stats</h2>' +
+        '<div class="map-list">' +
+        '<div>Cash: <b>' + fmtMoney(s.cash) + '</b></div>' +
+        '<div>Respect: <b>' + s.respect + ' (' + s.rank + ')</b></div>' +
+        '<div>Missions: <b>' + s.missionsDone + ' / 7</b></div>' +
+        '<div>Races won: <b>' + s.racesWon + ' / 3</b></div>' +
+        '<div>Sun Discs: <b>' + s.discs + ' / 15</b></div>' +
+        '<div>Taxi fares: <b>' + s.faresDone + '</b></div>' +
+        '<div>Wanted: <b>' + '★'.repeat(s.stars) + '☆'.repeat(5 - s.stars) + '</b></div>' +
+        '<div>Complete: <b>' + s.completePct + '%</b></div></div>';
+    } else if (tab === 'STORY') {
+      this.pauseBody.innerHTML =
+        '<h2>The Story So Far</h2><p>Dante Cruz, ex-racer turned mechanic, must raise $500,000 to buy his brother Marco\'s freedom from Don Salvador "El Tiburón" Vega before the debt comes due. With Bella Torres, Father Ortiz and Rosa Delgado at his side, he is going to rob the Fortuna Casino itself.</p>' +
+        '<div class="map-list">' + (s.story || []).map((m) => '<div>' + (m.done ? '✓ ' : '○ ') + m.chapter + ' — ' + m.title + '</div>').join('') + '</div>';
+    } else {
+      this.pauseBody.innerHTML =
+        '<h2>Settings</h2><div class="map-list">' +
+        '<div>Radio: <b>' + (s.radioOn ? 'On' : 'Off') + '</b> (R to change station)</div>' +
+        '<div>Time: <b>T toggles day / golden hour / night</b></div>' +
+        '<div>Photo mode: <b>P hides the HUD</b></div>' +
+        '<div>Save: <b>automatic at missions, Esc to pause</b></div></div>';
     }
   }
-  // police list
-  if (el.policeList && G.police) {
-    const list = G.policeList || [];
-    el.policeList.innerHTML = list.length
-      ? list.map((u) => '<div class="punit"><b>' + u.callSign + '</b> ' + u.dist + 'm · ' + u.action + '</div>').join('')
-      : '';
-  }
-  // crosshair on foot
-  if (el.crosshair) el.crosshair.style.display = inCar ? 'none' : 'block';
-  // minimap
-  const mm = el.minimap;
-  if (mm) {
-    const ctx = mm.getContext('2d');
-    ctx.save();
-    ctx.beginPath(); ctx.arc(mm.width / 2, mm.height / 2, mm.width / 2, 0, Math.PI * 2); ctx.clip();
-    drawMap(ctx, G, mm.width, {});
-    ctx.restore();
-    ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(mm.width / 2, mm.height / 2, mm.width / 2 - 1, 0, Math.PI * 2); ctx.stroke();
-  }
-  // race box
-  if (el.raceBox) {
-    const r = G.races.active;
-    el.raceBox.style.display = r ? 'block' : 'none';
-    if (r && el.raceStandings) {
-      el.raceStandings.innerHTML = r.standings.map((s) => '<div class="rstand' + (s.who === 'rio' ? ' me' : '') + '">' + s.pos + '. ' + s.name + '</div>').join('');
-      el.raceTimer.textContent = 'Lap ' + r.playerLap + '/' + r.race.laps + ' · ' + r.time.toFixed(1) + 's';
-    }
-  }
-  // vignette when wanted high / health low
-  if (el.vignette) {
-    const danger = Math.max(stars >= 3 ? 0.35 : 0, inCar && p.inCar.health < 30 ? 0.4 : 0);
-    el.vignette.style.opacity = String(danger);
-  }
-}
-
-// --- menus ----------------------------------------------------------------
-export function showTitle(G) {
-  const el = G.hud.el.title;
-  if (el) el.style.display = 'flex';
-}
-
-export function hideTitle(G) {
-  const el = G.hud.el.title;
-  if (el) el.style.display = 'none';
-}
-
-export function showPause(G, tab = 'map') {
-  const el = G.hud.el.pause;
-  if (!el) return;
-  el.style.display = 'flex';
-  G.ui.showPauseTab(tab);
-}
-
-export function hidePause(G) {
-  const el = G.hud.el.pause;
-  if (el) el.style.display = 'none';
-}
-
-export function fillStats(G) {
-  const el = G.hud.el.statsPane;
-  if (!el) return;
-  const pct = completionPercent(G.save);
-  el.innerHTML =
-    '<div class="stat"><span>Completion</span><b>' + pct + '%</b></div>' +
-    '<div class="stat"><span>Cash</span><b>' + fmtMoney(G.save.cash) + '</b></div>' +
-    '<div class="stat"><span>Respect</span><b>' + respectRank(G.acts.respect).name + ' (' + G.acts.respect + ')</b></div>' +
-    '<div class="stat"><span>Missions done</span><b>' + G.missions.done.size + ' / 7</b></div>' +
-    '<div class="stat"><span>Races won</span><b>' + G.acts.racesWon + ' / 3</b></div>' +
-    '<div class="stat"><span>Sun Discs</span><b>' + G.acts.collected.size + ' / 15</b></div>' +
-    '<div class="stat"><span>Taxi fares</span><b>' + G.acts.faresDone + '</b></div>' +
-    '<div class="stat"><span>Time played</span><b>' + Math.floor(G.playMinutes) + ' min</b></div>';
-  if (G.hud.el.completePct) G.hud.el.completePct.textContent = pct + '% COMPLETE';
-}
-
-export function fillStory(G) {
-  const el = G.hud.el.storyPane;
-  if (!el) return;
-  el.innerHTML = MISSIONS.map((m) => {
-    const done = G.missions.done.has(m.id);
-    const active = G.missions.active && G.missions.active.mission.id === m.id;
-    const cls = done ? 'done' : active ? 'active' : 'locked';
-    const giver = (CHARACTERS[m.giver] || {}).name || m.giver;
-    return '<div class="story ' + cls + '"><b>CH ' + m.chapter + ' — ' + m.title + '</b><span>' + (done ? 'DONE ✓' : active ? 'IN PROGRESS' : giver) + ' · ' + fmtMoney(m.reward) + '</span></div>';
-  }).join('');
-}
-
-export function centerMessage(hud, text, ms = 2200) {
-  const el = hud.el.centerMsg;
-  if (!el) return;
-  el.textContent = text;
-  el.style.display = 'block';
-  clearTimeout(hud._cmTimer);
-  hud._cmTimer = setTimeout(() => { el.style.display = 'none'; }, ms);
 }
